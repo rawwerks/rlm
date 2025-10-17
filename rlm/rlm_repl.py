@@ -1,8 +1,6 @@
-"""
-Simple Recursive Language Model (RLM) with REPL environment.
-"""
+"""Simple Recursive Language Model (RLM) with REPL environment."""
 
-from typing import Dict, List, Optional, Any 
+from typing import Dict, List, Optional, Any
 
 from rlm import RLM
 from rlm.repl import REPLEnv
@@ -43,6 +41,9 @@ class RLM_REPL(RLM):
         
         self.messages = [] # Initialize messages list
         self.query = None
+        self._context_data = None
+        self._context_str = None
+        self._conversation_active = False
     
     def setup_context(self, context: List[str] | str | List[Dict[str, str]], query: Optional[str] = None):
         """
@@ -61,28 +62,35 @@ class RLM_REPL(RLM):
         # Initialize the conversation with the REPL prompt
         self.messages = build_system_prompt()
         self.logger.log_initial_messages(self.messages)
-        
+
         # Initialize REPL environment with context data
         context_data, context_str = utils.convert_context_for_repl(context)
-        
+
         self.repl_env = REPLEnv(
-            context_json=context_data, 
-            context_str=context_str, 
+            context_json=context_data,
+            context_str=context_str,
             recursive_model=self.recursive_model,
         )
-        
+
+        self._context_data = context_data
+        self._context_str = context_str
+        self._conversation_active = True
+
         return self.messages
 
-    def completion(self, context: List[str] | str | List[Dict[str, str]], query: Optional[str] = None) -> str:
+    def _append_query_message(self, query: str, *, is_followup: bool) -> None:
+        label = "Follow-up query" if is_followup else "User query"
+        message = {"role": "user", "content": f"{label}:\n{query}"}
+        self.messages.append(message)
+
+    def _run_root_loop(self, query: str) -> str:
         """
         Given a query and a (potentially long) context, recursively call the LM
         to explore the context and provide an answer using a REPL environment.
         """
-        self.messages = self.setup_context(context, query)
-        
         # Main loop runs for fixed # of root LM iterations
         for iteration in range(self._max_iterations):
-            
+
             # Query root LM to interact with REPL environment
             response = self.llm.completion(self.messages + [next_action_prompt(query, iteration)])
             
@@ -109,16 +117,42 @@ class RLM_REPL(RLM):
             # In practice, you may need some guardrails here.
             if final_answer:
                 self.logger.log_final_response(final_answer)
+                self.messages.append({
+                    "role": "assistant",
+                    "content": f"Final answer for '{query}':\n{final_answer}"
+                })
                 return final_answer
 
-            
+
         # If we reach here, no final answer was found in any iteration
         print("No final answer found in any iteration")
         self.messages.append(next_action_prompt(query, iteration, final_answer=True))
         final_answer = self.llm.completion(self.messages)
         self.logger.log_final_response(final_answer)
+        self.messages.append({
+            "role": "assistant",
+            "content": f"Final answer for '{query}':\n{final_answer}"
+        })
 
         return final_answer
+
+    def completion(self, context: List[str] | str | List[Dict[str, str]], query: Optional[str] = None) -> str:
+        self.messages = self.setup_context(context, query)
+        if self.query is None:
+            raise ValueError("A query is required to start the conversation.")
+        self._append_query_message(self.query, is_followup=False)
+        return self._run_root_loop(self.query)
+
+    def ask_followup(self, query: str) -> str:
+        if not self._conversation_active or self.repl_env is None:
+            raise RuntimeError("No active conversation. Call completion() with a context first.")
+        if not query:
+            raise ValueError("Follow-up query cannot be empty.")
+
+        self.query = query
+        self.logger.log_query_start(query)
+        self._append_query_message(query, is_followup=True)
+        return self._run_root_loop(query)
     
     def cost_summary(self) -> Dict[str, Any]:
         """Get the cost summary of the Root LM + Sub-RLM Calls."""
@@ -129,6 +163,9 @@ class RLM_REPL(RLM):
         self.repl_env = REPLEnv()
         self.messages = []
         self.query = None
+        self._context_data = None
+        self._context_str = None
+        self._conversation_active = False
 
 
 if __name__ == "__main__":
