@@ -1,7 +1,9 @@
 # Recursive Language Models (minimal version) 
 
 [Link to the official RLM codebase](https://github.com/alexzhang13/rlm)
+
 [Link to the paper](https://arxiv.org/abs/2512.24601v1)
+
 [Link to the original blogpost 📝](https://alexzhang13.github.io/blog/2025/rlm/)
 
 I received a lot of requests to put out a notebook or gist version of the codebase I've been using. Sadly it's a bit entangled with a bunch of random state, cost, and code execution tracking logic that I want to clean up while I run other experiments. In the meantime, I've re-written a simpler version of what I'm using so people can get started building on top and writing their own RLM implementations. Happy hacking!
