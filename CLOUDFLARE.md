@@ -79,12 +79,30 @@ First run takes 2-3 minutes to build the container; subsequent runs are faster.
 
 ## Using CloudflareREPL
 
+### Environment Variables
+
+CloudflareREPL supports configuration via environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `RLM_CF_WORKER_URL` | Default worker URL (if not passed to constructor) |
+| `RLM_CF_AUTH_TOKEN` | Default auth token (if not passed to constructor) |
+
+```bash
+# Set env vars for easy usage
+export RLM_CF_WORKER_URL=https://rlm-sandbox.example.workers.dev
+export RLM_CF_AUTH_TOKEN=your-auth-token
+```
+
 ### Basic Usage
 
 ```python
 from rlm.environments import get_environment
 
-# Create environment
+# With env vars set, minimal config needed:
+env = get_environment("cloudflare", {})
+
+# Or explicitly pass URL:
 env = get_environment("cloudflare", {
     "worker_url": "https://rlm-sandbox.example.workers.dev",
     "auth_token": "your-auth-token",  # Optional if not configured
@@ -109,12 +127,14 @@ env.cleanup()
 ```python
 from rlm.environments.cloudflare_repl import CloudflareREPL
 
-with CloudflareREPL(
-    worker_url="https://rlm-sandbox.example.workers.dev",
-    auth_token="",
-) as repl:
+# Uses RLM_CF_WORKER_URL and RLM_CF_AUTH_TOKEN env vars
+with CloudflareREPL() as repl:
     result = repl.execute_code("import numpy as np\nprint(np.sum([1,2,3]))")
     print(result.stdout)  # "6\n"
+
+# Or with explicit URL
+with CloudflareREPL(worker_url="https://rlm-sandbox.example.workers.dev") as repl:
+    result = repl.execute_code("print('hello')")
 ```
 
 ### Loading Context

@@ -7,6 +7,7 @@ Unlike Modal, Cloudflare Sandboxes are accessed via HTTP API rather than a Pytho
 
 import base64
 import json
+import os
 import textwrap
 import threading
 import time
@@ -194,10 +195,14 @@ class CloudflareREPL(IsolatedEnv):
     Runs Python code in Cloudflare's container-based Sandbox SDK.
     Requires a running Cloudflare Worker with Sandbox SDK configured.
 
-    Configuration requires:
-    - worker_url: URL of the Cloudflare Worker (e.g., https://my-worker.user.workers.dev)
-    - auth_token: Bearer token for authenticating with the Worker
+    Configuration:
+    - worker_url: URL of the Cloudflare Worker (or set RLM_CF_WORKER_URL env var)
+    - auth_token: Bearer token for the Worker (or set RLM_CF_AUTH_TOKEN env var)
     - sandbox_id: Optional sandbox ID for session persistence (auto-generated if not provided)
+
+    Environment variables:
+    - RLM_CF_WORKER_URL: Default worker URL if not passed to constructor
+    - RLM_CF_AUTH_TOKEN: Default auth token if not passed to constructor
 
     The Worker should expose these endpoints:
     - POST /sandbox/exec - Execute a command in the sandbox
@@ -207,8 +212,8 @@ class CloudflareREPL(IsolatedEnv):
 
     def __init__(
         self,
-        worker_url: str,
-        auth_token: str,
+        worker_url: str | None = None,
+        auth_token: str | None = None,
         sandbox_id: str | None = None,
         timeout: int = 300,
         lm_handler_address: tuple[str, int] | None = None,
@@ -219,8 +224,13 @@ class CloudflareREPL(IsolatedEnv):
     ):
         super().__init__(**kwargs)
 
-        self.worker_url = worker_url.rstrip("/")
-        self.auth_token = auth_token
+        # Support env vars for worker URL and auth token
+        self.worker_url = (worker_url or os.environ.get("RLM_CF_WORKER_URL", "")).rstrip("/")
+        if not self.worker_url:
+            raise ValueError(
+                "worker_url must be provided or RLM_CF_WORKER_URL environment variable must be set"
+            )
+        self.auth_token = auth_token if auth_token is not None else os.environ.get("RLM_CF_AUTH_TOKEN", "")
         self.sandbox_id = sandbox_id or f"rlm-{int(time.time())}"
         self.timeout = timeout
         self.lm_handler_address = lm_handler_address
