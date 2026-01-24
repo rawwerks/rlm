@@ -159,6 +159,7 @@ class RLM:
         self._consecutive_errors: int = 0
         self._last_error: str | None = None
         self._best_partial_answer: str | None = None
+        self._completion_start_time: float | None = None  # Set when completion() starts
 
         # Persistence support
         self.persistent = persistent
@@ -275,6 +276,7 @@ class RLM:
             A final answer as a string.
         """
         time_start = time.perf_counter()
+        self._completion_start_time = time_start
 
         # Reset tracking state for this completion
         self._consecutive_errors = 0
@@ -514,8 +516,8 @@ class RLM:
 
         Args:
             prompt: The prompt to process.
-            model: Optional model name. Note: Not yet supported for recursive calls.
-                   Currently uses the configured backends regardless of this parameter.
+            model: Optional model name. If specified, the child RLM will use this model
+                   instead of inheriting the parent's default backend.
 
         Returns:
             The response string from either a child RLM or plain LM completion.
@@ -523,13 +525,21 @@ class RLM:
         """
         next_depth = self.depth + 1
 
+        # Determine which backend/kwargs to use (model override or parent's default)
+        if model is not None:
+            # Override backend_kwargs with the specified model
+            child_backend_kwargs = (self.backend_kwargs or {}).copy()
+            child_backend_kwargs["model_name"] = model
+        else:
+            child_backend_kwargs = self.backend_kwargs
+
         # If we'd hit/exceed the cap, do a normal LM completion (no REPL)
         if next_depth >= self.max_depth:
             # Use other_backend if available, otherwise use main backend
             if self.other_backends and self.other_backend_kwargs:
                 client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
             else:
-                client = get_client(self.backend, self.backend_kwargs)
+                client = get_client(self.backend, child_backend_kwargs or {})
             try:
                 return client.completion(prompt)
             except Exception as e:
@@ -542,16 +552,27 @@ class RLM:
             if remaining_budget <= 0:
                 return f"Error: Budget exhausted (spent ${self._cumulative_cost:.6f} of ${self.max_budget:.6f})"
 
+        # Calculate remaining timeout for child (if timeout tracking enabled)
+        remaining_timeout = None
+        if self.max_timeout is not None and self._completion_start_time is not None:
+            elapsed = time.perf_counter() - self._completion_start_time
+            remaining_timeout = self.max_timeout - elapsed
+            if remaining_timeout <= 0:
+                return f"Error: Timeout exhausted ({elapsed:.1f}s of {self.max_timeout:.1f}s)"
+
         # Spawn a child RLM with its own LocalREPL
         child = RLM(
             backend=self.backend,
-            backend_kwargs=self.backend_kwargs,
+            backend_kwargs=child_backend_kwargs,
             environment=self.environment_type,
             environment_kwargs=self.environment_kwargs,
             depth=next_depth,
             max_depth=self.max_depth,
             max_iterations=self.max_iterations,
             max_budget=remaining_budget,
+            max_timeout=remaining_timeout,
+            max_tokens=self.max_tokens,
+            max_errors=self.max_errors,
             custom_system_prompt=self.system_prompt,
             other_backends=self.other_backends,
             other_backend_kwargs=self.other_backend_kwargs,
