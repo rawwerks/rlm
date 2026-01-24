@@ -1,5 +1,7 @@
+import signal
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from rlm.clients import BaseLM, get_client
@@ -165,6 +167,15 @@ class RLM:
         self.persistent = persistent
         self._persistent_env: SupportsPersistence | None = None
 
+        # Early exit support (SIGUSR1)
+        self._early_exit_requested: bool = False
+        self._original_sigusr1_handler: signal.Handlers | None = None
+
+        # Inject file support (update variables mid-run)
+        inject_file_str = self.environment_kwargs.pop("inject_file", None)
+        self._inject_file: Path | None = Path(inject_file_str) if inject_file_str else None
+        self._inject_file_mtime: float = 0.0
+
         # Validate persistence support at initialization
         if self.persistent:
             self._validate_persistent_environment_support()
@@ -282,169 +293,188 @@ class RLM:
         self._consecutive_errors = 0
         self._last_error = None
         self._best_partial_answer = None
+        self._early_exit_requested = False
 
-        # If we're at max depth, the RLM is an LM, so we fallback to the regular LM.
-        if self.depth >= self.max_depth:
-            return self._fallback_answer(prompt)
+        # Install signal handlers for graceful early exit
+        self._setup_signal_handlers()
 
-        with self._spawn_completion_context(prompt) as (lm_handler, environment):
-            message_history = self._setup_prompt(prompt)
+        try:
+            # If we're at max depth, the RLM is an LM, so we fallback to the regular LM.
+            if self.depth >= self.max_depth:
+                return self._fallback_answer(prompt)
 
-            try:
-                for i in range(self.max_iterations):
-                    # Check timeout before each iteration
-                    if self.max_timeout is not None:
-                        elapsed = time.perf_counter() - time_start
-                        if elapsed > self.max_timeout:
-                            self.verbose.print_limit_exceeded("timeout", f"{elapsed:.1f}s of {self.max_timeout:.1f}s")
-                            raise TimeoutExceededError(
-                                elapsed=elapsed,
-                                timeout=self.max_timeout,
+            with self._spawn_completion_context(prompt) as (lm_handler, environment):
+                message_history = self._setup_prompt(prompt)
+
+                try:
+                    for i in range(self.max_iterations):
+                        # Check for early exit request (SIGUSR1)
+                        if self._early_exit_requested:
+                            self.verbose.print_limit_exceeded("early_exit", "User requested early exit (SIGUSR1)")
+                            raise CancellationError(
                                 partial_answer=self._best_partial_answer,
-                                message=f"Timeout exceeded after iteration {i}: {elapsed:.1f}s of {self.max_timeout:.1f}s limit",
+                                message="Early exit requested by user (SIGUSR1)",
                             )
 
-                    # Current prompt = message history + additional prompt suffix
-                    context_count = (
-                        environment.get_context_count()
-                        if isinstance(environment, SupportsPersistence)
-                        else 1
-                    )
-                    history_count = (
-                        environment.get_history_count()
-                        if isinstance(environment, SupportsPersistence)
-                        else 0
-                    )
-                    current_prompt = message_history + [
-                        build_user_prompt(root_prompt, i, context_count, history_count)
-                    ]
+                        # Check and execute inject file if changed (update variables mid-run)
+                        self._check_and_execute_inject_file(environment)
 
-                    iteration: RLMIteration = self._completion_turn(
-                        prompt=current_prompt,
-                        lm_handler=lm_handler,
-                        environment=environment,
-                    )
+                        # Check timeout before each iteration
+                        if self.max_timeout is not None:
+                            elapsed = time.perf_counter() - time_start
+                            if elapsed > self.max_timeout:
+                                self.verbose.print_limit_exceeded("timeout", f"{elapsed:.1f}s of {self.max_timeout:.1f}s")
+                                raise TimeoutExceededError(
+                                    elapsed=elapsed,
+                                    timeout=self.max_timeout,
+                                    partial_answer=self._best_partial_answer,
+                                    message=f"Timeout exceeded after iteration {i}: {elapsed:.1f}s of {self.max_timeout:.1f}s limit",
+                                )
 
-                    # Track errors from code execution (check stderr for errors)
-                    iteration_had_error = False
-                    for code_block in iteration.code_blocks:
-                        if code_block.result and code_block.result.stderr:
-                            iteration_had_error = True
-                            self._last_error = code_block.result.stderr
-                            break
+                        # Current prompt = message history + additional prompt suffix
+                        context_count = (
+                            environment.get_context_count()
+                            if isinstance(environment, SupportsPersistence)
+                            else 1
+                        )
+                        history_count = (
+                            environment.get_history_count()
+                            if isinstance(environment, SupportsPersistence)
+                            else 0
+                        )
+                        current_prompt = message_history + [
+                            build_user_prompt(root_prompt, i, context_count, history_count)
+                        ]
 
-                    if iteration_had_error:
-                        self._consecutive_errors += 1
-                    else:
-                        self._consecutive_errors = 0  # Reset on success
-
-                    # Check error threshold
-                    if self.max_errors is not None and self._consecutive_errors >= self.max_errors:
-                        self.verbose.print_limit_exceeded("errors", f"{self._consecutive_errors} consecutive errors (limit: {self.max_errors})")
-                        raise ErrorThresholdExceededError(
-                            error_count=self._consecutive_errors,
-                            threshold=self.max_errors,
-                            last_error=self._last_error,
-                            partial_answer=self._best_partial_answer,
-                            message=f"Error threshold exceeded: {self._consecutive_errors} consecutive errors (limit: {self.max_errors})",
+                        iteration: RLMIteration = self._completion_turn(
+                            prompt=current_prompt,
+                            lm_handler=lm_handler,
+                            environment=environment,
                         )
 
-                    # Check budget after each iteration
-                    if self.max_budget is not None:
-                        current_usage = lm_handler.get_usage_summary()
-                        current_cost = current_usage.total_cost or 0.0
-                        self._cumulative_cost = current_cost
-                        if self._cumulative_cost > self.max_budget:
-                            self.verbose.print_budget_exceeded(self._cumulative_cost, self.max_budget)
-                            raise BudgetExceededError(
-                                spent=self._cumulative_cost,
-                                budget=self.max_budget,
-                                message=f"Budget exceeded after iteration {i + 1}: spent ${self._cumulative_cost:.6f} of ${self.max_budget:.6f} budget",
-                            )
+                        # Track errors from code execution (check stderr for errors)
+                        iteration_had_error = False
+                        for code_block in iteration.code_blocks:
+                            if code_block.result and code_block.result.stderr:
+                                iteration_had_error = True
+                                self._last_error = code_block.result.stderr
+                                break
 
-                    # Check token limit after each iteration
-                    if self.max_tokens is not None:
-                        current_usage = lm_handler.get_usage_summary()
-                        total_tokens = current_usage.total_input_tokens + current_usage.total_output_tokens
-                        if total_tokens > self.max_tokens:
-                            self.verbose.print_limit_exceeded("tokens", f"{total_tokens:,} of {self.max_tokens:,} tokens")
-                            raise TokenLimitExceededError(
-                                tokens_used=total_tokens,
-                                token_limit=self.max_tokens,
+                        if iteration_had_error:
+                            self._consecutive_errors += 1
+                        else:
+                            self._consecutive_errors = 0  # Reset on success
+
+                        # Check error threshold
+                        if self.max_errors is not None and self._consecutive_errors >= self.max_errors:
+                            self.verbose.print_limit_exceeded("errors", f"{self._consecutive_errors} consecutive errors (limit: {self.max_errors})")
+                            raise ErrorThresholdExceededError(
+                                error_count=self._consecutive_errors,
+                                threshold=self.max_errors,
+                                last_error=self._last_error,
                                 partial_answer=self._best_partial_answer,
-                                message=f"Token limit exceeded after iteration {i + 1}: {total_tokens:,} of {self.max_tokens:,} tokens",
+                                message=f"Error threshold exceeded: {self._consecutive_errors} consecutive errors (limit: {self.max_errors})",
                             )
 
-                    # Check if RLM is done and has a final answer.
-                    final_answer = find_final_answer(iteration.response, environment=environment)
-                    iteration.final_answer = final_answer
+                        # Check budget after each iteration
+                        if self.max_budget is not None:
+                            current_usage = lm_handler.get_usage_summary()
+                            current_cost = current_usage.total_cost or 0.0
+                            self._cumulative_cost = current_cost
+                            if self._cumulative_cost > self.max_budget:
+                                self.verbose.print_budget_exceeded(self._cumulative_cost, self.max_budget)
+                                raise BudgetExceededError(
+                                    spent=self._cumulative_cost,
+                                    budget=self.max_budget,
+                                    message=f"Budget exceeded after iteration {i + 1}: spent ${self._cumulative_cost:.6f} of ${self.max_budget:.6f} budget",
+                                )
 
-                    # Store as best partial answer (most recent response with content)
-                    if iteration.response and iteration.response.strip():
-                        self._best_partial_answer = iteration.response
+                        # Check token limit after each iteration
+                        if self.max_tokens is not None:
+                            current_usage = lm_handler.get_usage_summary()
+                            total_tokens = current_usage.total_input_tokens + current_usage.total_output_tokens
+                            if total_tokens > self.max_tokens:
+                                self.verbose.print_limit_exceeded("tokens", f"{total_tokens:,} of {self.max_tokens:,} tokens")
+                                raise TokenLimitExceededError(
+                                    tokens_used=total_tokens,
+                                    token_limit=self.max_tokens,
+                                    partial_answer=self._best_partial_answer,
+                                    message=f"Token limit exceeded after iteration {i + 1}: {total_tokens:,} of {self.max_tokens:,} tokens",
+                                )
 
-                    # If logger is used, log the iteration.
-                    if self.logger:
-                        self.logger.log(iteration)
+                        # Check if RLM is done and has a final answer.
+                        final_answer = find_final_answer(iteration.response, environment=environment)
+                        iteration.final_answer = final_answer
 
-                    # Verbose output for this iteration
-                    self.verbose.print_iteration(iteration, i + 1)
+                        # Store as best partial answer (most recent response with content)
+                        if iteration.response and iteration.response.strip():
+                            self._best_partial_answer = iteration.response
 
-                    if final_answer is not None:
-                        time_end = time.perf_counter()
-                        usage = lm_handler.get_usage_summary()
-                        self.verbose.print_final_answer(final_answer)
-                        self.verbose.print_summary(i + 1, time_end - time_start, usage.to_dict())
+                        # If logger is used, log the iteration.
+                        if self.logger:
+                            self.logger.log(iteration)
 
-                        # Store message history in persistent environment
-                        if self.persistent and isinstance(environment, SupportsPersistence):
-                            environment.add_history(message_history)
+                        # Verbose output for this iteration
+                        self.verbose.print_iteration(iteration, i + 1)
 
-                        return RLMChatCompletion(
-                            root_model=self.backend_kwargs.get("model_name", "unknown")
-                            if self.backend_kwargs
-                            else "unknown",
-                            prompt=prompt,
-                            response=final_answer,
-                            usage_summary=usage,
-                            execution_time=time_end - time_start,
-                        )
+                        if final_answer is not None:
+                            time_end = time.perf_counter()
+                            usage = lm_handler.get_usage_summary()
+                            self.verbose.print_final_answer(final_answer)
+                            self.verbose.print_summary(i + 1, time_end - time_start, usage.to_dict())
 
-                    # Format the iteration for the next prompt.
-                    new_messages = format_iteration(iteration)
+                            # Store message history in persistent environment
+                            if self.persistent and isinstance(environment, SupportsPersistence):
+                                environment.add_history(message_history)
 
-                    # Update message history with the new messages.
-                    message_history.extend(new_messages)
+                            return RLMChatCompletion(
+                                root_model=self.backend_kwargs.get("model_name", "unknown")
+                                if self.backend_kwargs
+                                else "unknown",
+                                prompt=prompt,
+                                response=final_answer,
+                                usage_summary=usage,
+                                execution_time=time_end - time_start,
+                            )
 
-            except KeyboardInterrupt:
-                # User cancelled - return best answer if available
+                        # Format the iteration for the next prompt.
+                        new_messages = format_iteration(iteration)
+
+                        # Update message history with the new messages.
+                        message_history.extend(new_messages)
+
+                except KeyboardInterrupt:
+                    # User cancelled - return best answer if available
+                    time_end = time.perf_counter()
+                    self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
+                    raise CancellationError(
+                        partial_answer=self._best_partial_answer,
+                        message="Execution cancelled by user (Ctrl+C)",
+                    )
+
+                # Default behavior: we run out of iterations, provide one final answer
                 time_end = time.perf_counter()
-                self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
-                raise CancellationError(
-                    partial_answer=self._best_partial_answer,
-                    message="Execution cancelled by user (Ctrl+C)",
+                final_answer = self._default_answer(message_history, lm_handler)
+                usage = lm_handler.get_usage_summary()
+                self.verbose.print_final_answer(final_answer)
+                self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
+
+                # Store message history in persistent environment
+                if self.persistent and isinstance(environment, SupportsPersistence):
+                    environment.add_history(message_history)
+
+                return RLMChatCompletion(
+                    root_model=self.backend_kwargs.get("model_name", "unknown")
+                    if self.backend_kwargs
+                    else "unknown",
+                    prompt=prompt,
+                    response=final_answer,
+                    usage_summary=usage,
+                    execution_time=time_end - time_start,
                 )
-
-            # Default behavior: we run out of iterations, provide one final answer
-            time_end = time.perf_counter()
-            final_answer = self._default_answer(message_history, lm_handler)
-            usage = lm_handler.get_usage_summary()
-            self.verbose.print_final_answer(final_answer)
-            self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
-
-            # Store message history in persistent environment
-            if self.persistent and isinstance(environment, SupportsPersistence):
-                environment.add_history(message_history)
-
-            return RLMChatCompletion(
-                root_model=self.backend_kwargs.get("model_name", "unknown")
-                if self.backend_kwargs
-                else "unknown",
-                prompt=prompt,
-                response=final_answer,
-                usage_summary=usage,
-                execution_time=time_end - time_start,
-            )
+        finally:
+            # Restore original signal handlers
+            self._restore_signal_handlers()
 
     def _completion_turn(
         self,
@@ -625,6 +655,56 @@ class RLM:
     def _env_supports_persistence(env: BaseEnv) -> bool:
         """Check if an environment instance supports persistent mode methods."""
         return isinstance(env, SupportsPersistence)
+
+    def _setup_signal_handlers(self) -> None:
+        """Install SIGUSR1 handler for graceful early exit (Unix only)."""
+        if not hasattr(signal, "SIGUSR1"):
+            return  # Windows doesn't have SIGUSR1
+        try:
+            self._original_sigusr1_handler = signal.signal(
+                signal.SIGUSR1, self._handle_sigusr1
+            )
+        except (ValueError, OSError):
+            # Can't set signal handler (e.g., not in main thread)
+            pass
+
+    def _restore_signal_handlers(self) -> None:
+        """Restore original SIGUSR1 handler."""
+        if not hasattr(signal, "SIGUSR1"):
+            return
+        if self._original_sigusr1_handler is not None:
+            try:
+                signal.signal(signal.SIGUSR1, self._original_sigusr1_handler)
+            except (ValueError, OSError):
+                pass
+            self._original_sigusr1_handler = None
+
+    def _handle_sigusr1(self, signum: int, frame: Any) -> None:
+        """Handle SIGUSR1 by setting early exit flag."""
+        self._early_exit_requested = True
+
+    def _check_and_execute_inject_file(self, environment: BaseEnv) -> None:
+        """Check if inject file changed and execute its contents in the REPL.
+
+        This allows users to update variables mid-run by modifying the inject file.
+        The code is executed exactly like LLM-generated code would be.
+        """
+        if self._inject_file is None:
+            return
+        if not self._inject_file.exists():
+            return
+
+        try:
+            current_mtime = self._inject_file.stat().st_mtime
+            if current_mtime > self._inject_file_mtime:
+                code = self._inject_file.read_text()
+                if code.strip():
+                    self.verbose.print_limit_exceeded("inject", f"Executing inject file: {self._inject_file}")
+                    environment.execute_code(code)
+                self._inject_file_mtime = current_mtime
+        except (OSError, IOError) as e:
+            # Log error but don't fail the iteration
+            self.verbose.print_limit_exceeded("inject_error", f"Failed to read inject file: {e}")
 
     def close(self) -> None:
         """Clean up persistent environment. Call when done with multi-turn conversations."""
