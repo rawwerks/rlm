@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Callable
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
 from rlm.core.types import REPLResult, RLMChatCompletion
@@ -125,11 +125,13 @@ class LocalREPL(NonIsolatedEnv):
         setup_code: str | None = None,
         persistent: bool = False,
         depth: int = 1,
+        subcall_fn: Callable[[str, str | None], str] | None = None,
         **kwargs,
     ):
         super().__init__(persistent=persistent, depth=depth, **kwargs)
 
         self.lm_handler_address = lm_handler_address
+        self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
         self.original_cwd = os.getcwd()
         self.temp_dir = tempfile.mkdtemp(prefix=f"repl_env_{uuid.uuid4()}_")
         self._lock = threading.Lock()
@@ -172,12 +174,23 @@ class LocalREPL(NonIsolatedEnv):
         return f"Error: Variable '{variable_name}' not found"
 
     def _llm_query(self, prompt: str, model: str | None = None) -> str:
-        """Query the LM via socket connection to the handler.
+        """Query the LM, potentially spawning a recursive RLM call.
+
+        When subcall_fn is provided (for max_depth > 1), uses callback-based
+        recursive RLM calls. Otherwise, falls back to socket-based LM handler.
 
         Args:
             prompt: The prompt to send to the LM.
             model: Optional model name to use (if handler has multiple clients).
         """
+        # If we have a subcall callback, use it for recursive RLM calls
+        if self.subcall_fn is not None:
+            try:
+                return self.subcall_fn(prompt, model)
+            except Exception as e:
+                return f"Error: LM query failed - {e}"
+
+        # Fall back to socket-based LM handler communication
         if not self.lm_handler_address:
             return "Error: No LM handler configured"
 
@@ -198,7 +211,11 @@ class LocalREPL(NonIsolatedEnv):
             return f"Error: LM query failed - {e}"
 
     def _llm_query_batched(self, prompts: list[str], model: str | None = None) -> list[str]:
-        """Query the LM with multiple prompts concurrently.
+        """Query the LM with multiple prompts, potentially as recursive RLM calls.
+
+        When subcall_fn is provided (for max_depth > 1), uses callback-based
+        recursive RLM calls (sequential for simplicity). Otherwise, falls back
+        to socket-based concurrent LM handler calls.
 
         Args:
             prompts: List of prompts to send to the LM.
@@ -207,6 +224,17 @@ class LocalREPL(NonIsolatedEnv):
         Returns:
             List of responses in the same order as input prompts.
         """
+        # If we have a subcall callback, use it for recursive RLM calls (sequential)
+        if self.subcall_fn is not None:
+            results = []
+            for prompt in prompts:
+                try:
+                    results.append(self.subcall_fn(prompt, model))
+                except Exception as e:
+                    results.append(f"Error: LM query failed - {e}")
+            return results
+
+        # Fall back to socket-based LM handler communication (concurrent)
         if not self.lm_handler_address:
             return ["Error: No LM handler configured"] * len(prompts)
 
