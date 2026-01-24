@@ -218,6 +218,9 @@ def serialize_locals(state):
 _locals = load_state()
 
 def FINAL_VAR(variable_name):
+    # If passed a non-string (e.g., dict, list), convert directly
+    if not isinstance(variable_name, str):
+        return str(variable_name)
     variable_name = variable_name.strip().strip("\\"\\'")
     if variable_name in _locals:
         return str(_locals[variable_name])

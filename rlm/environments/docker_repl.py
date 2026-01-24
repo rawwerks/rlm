@@ -141,6 +141,9 @@ def save_state(s):
 _locals = load_state()
 
 def FINAL_VAR(name):
+    # If passed a non-string (e.g., dict, list), convert directly
+    if not isinstance(name, str):
+        return str(name)
     name = name.strip().strip("\\"\\'")
     return str(_locals.get(name, f"Error: Variable '{{name}}' not found"))
 

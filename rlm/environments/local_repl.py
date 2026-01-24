@@ -167,7 +167,16 @@ class LocalREPL(NonIsolatedEnv):
         self.globals["llm_query_batched"] = self._llm_query_batched
 
     def _final_var(self, variable_name: str) -> str:
-        """Return the value of a variable as a final answer."""
+        """Return the value of a variable as a final answer.
+
+        Args:
+            variable_name: Name of the variable to return (as a string).
+                          If a non-string is passed, it's converted directly.
+        """
+        # If passed a non-string (e.g., dict, list), convert directly
+        if not isinstance(variable_name, str):
+            return str(variable_name)
+
         variable_name = variable_name.strip().strip("\"'")
         if variable_name in self.locals:
             return str(self.locals[variable_name])

@@ -141,6 +141,17 @@ class TestLocalREPLHelpers:
         assert "Error" in repl.locals["result"]
         repl.cleanup()
 
+    def test_final_var_non_string(self):
+        """Test FINAL_VAR with non-string argument (dict, list, etc.)."""
+        repl = LocalREPL()
+        # Passing a dict directly should convert it to string (not crash)
+        _ = repl.execute_code("result = FINAL_VAR({'key': 'value'})")
+        assert repl.locals["result"] == "{'key': 'value'}"
+        # Passing a list directly
+        _ = repl.execute_code("result2 = FINAL_VAR([1, 2, 3])")
+        assert repl.locals["result2"] == "[1, 2, 3]"
+        repl.cleanup()
+
     def test_llm_query_no_handler(self):
         """Test llm_query without handler configured."""
         repl = LocalREPL()
