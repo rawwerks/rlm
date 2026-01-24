@@ -38,6 +38,45 @@ class BudgetExceededError(Exception):
         super().__init__(message or f"Budget exceeded: spent ${spent:.6f} of ${budget:.6f} budget")
 
 
+class TimeoutExceededError(Exception):
+    """Raised when the RLM execution exceeds the maximum timeout."""
+
+    def __init__(self, elapsed: float, timeout: float, partial_answer: str | None = None, message: str | None = None):
+        self.elapsed = elapsed
+        self.timeout = timeout
+        self.partial_answer = partial_answer
+        super().__init__(message or f"Timeout exceeded: {elapsed:.1f}s of {timeout:.1f}s limit")
+
+
+class TokenLimitExceededError(Exception):
+    """Raised when the RLM execution exceeds the maximum token limit."""
+
+    def __init__(self, tokens_used: int, token_limit: int, partial_answer: str | None = None, message: str | None = None):
+        self.tokens_used = tokens_used
+        self.token_limit = token_limit
+        self.partial_answer = partial_answer
+        super().__init__(message or f"Token limit exceeded: {tokens_used:,} of {token_limit:,} tokens")
+
+
+class ErrorThresholdExceededError(Exception):
+    """Raised when the RLM encounters too many consecutive errors."""
+
+    def __init__(self, error_count: int, threshold: int, last_error: str | None = None, partial_answer: str | None = None, message: str | None = None):
+        self.error_count = error_count
+        self.threshold = threshold
+        self.last_error = last_error
+        self.partial_answer = partial_answer
+        super().__init__(message or f"Error threshold exceeded: {error_count} consecutive errors (limit: {threshold})")
+
+
+class CancellationError(Exception):
+    """Raised when the RLM execution is cancelled by the user."""
+
+    def __init__(self, partial_answer: str | None = None, message: str | None = None):
+        self.partial_answer = partial_answer
+        super().__init__(message or "Execution cancelled by user")
+
+
 class RLM:
     """
     Recursive Language Model class that the user instantiates and runs on their tasks.
@@ -56,6 +95,9 @@ class RLM:
         max_depth: int = 1,
         max_iterations: int = 30,
         max_budget: float | None = None,
+        max_timeout: float | None = None,
+        max_tokens: int | None = None,
+        max_errors: int | None = None,
         custom_system_prompt: str | None = None,
         other_backends: list[ClientBackend] | None = None,
         other_backend_kwargs: list[dict[str, Any]] | None = None,
@@ -73,6 +115,9 @@ class RLM:
             max_depth: The maximum depth of recursion. When depth >= max_depth, falls back to plain LM completion.
             max_iterations: The maximum number of iterations of the RLM.
             max_budget: Maximum budget in USD. Execution stops if exceeded. Requires cost-tracking backend (e.g., OpenRouter).
+            max_timeout: Maximum execution time in seconds. Execution stops if exceeded, returning best answer if available.
+            max_tokens: Maximum total tokens (input + output). Execution stops if exceeded, returning best answer if available.
+            max_errors: Maximum consecutive errors before stopping. Execution stops if exceeded, returning best answer if available.
             custom_system_prompt: The custom system prompt to use for the RLM.
             other_backends: A list of other client backends that the environments can use to make sub-calls.
             other_backend_kwargs: The kwargs to pass to the other client backends (ordered to match other_backends).
@@ -102,12 +147,18 @@ class RLM:
         self.max_depth = max_depth
         self.max_iterations = max_iterations
         self.max_budget = max_budget
+        self.max_timeout = max_timeout
+        self.max_tokens = max_tokens
+        self.max_errors = max_errors
         self.system_prompt = custom_system_prompt if custom_system_prompt else RLM_SYSTEM_PROMPT
         self.logger = logger
         self.verbose = VerbosePrinter(enabled=verbose)
 
-        # Budget tracking (cumulative across all calls including children)
+        # Tracking (cumulative across all calls including children)
         self._cumulative_cost: float = 0.0
+        self._consecutive_errors: int = 0
+        self._last_error: str | None = None
+        self._best_partial_answer: str | None = None
 
         # Persistence support
         self.persistent = persistent
@@ -225,6 +276,11 @@ class RLM:
         """
         time_start = time.perf_counter()
 
+        # Reset tracking state for this completion
+        self._consecutive_errors = 0
+        self._last_error = None
+        self._best_partial_answer = None
+
         # If we're at max depth, the RLM is an LM, so we fallback to the regular LM.
         if self.depth >= self.max_depth:
             return self._fallback_answer(prompt)
@@ -232,78 +288,140 @@ class RLM:
         with self._spawn_completion_context(prompt) as (lm_handler, environment):
             message_history = self._setup_prompt(prompt)
 
-            for i in range(self.max_iterations):
-                # Current prompt = message history + additional prompt suffix
-                context_count = (
-                    environment.get_context_count()
-                    if isinstance(environment, SupportsPersistence)
-                    else 1
-                )
-                history_count = (
-                    environment.get_history_count()
-                    if isinstance(environment, SupportsPersistence)
-                    else 0
-                )
-                current_prompt = message_history + [
-                    build_user_prompt(root_prompt, i, context_count, history_count)
-                ]
+            try:
+                for i in range(self.max_iterations):
+                    # Check timeout before each iteration
+                    if self.max_timeout is not None:
+                        elapsed = time.perf_counter() - time_start
+                        if elapsed > self.max_timeout:
+                            self.verbose.print_limit_exceeded("timeout", f"{elapsed:.1f}s of {self.max_timeout:.1f}s")
+                            raise TimeoutExceededError(
+                                elapsed=elapsed,
+                                timeout=self.max_timeout,
+                                partial_answer=self._best_partial_answer,
+                                message=f"Timeout exceeded after iteration {i}: {elapsed:.1f}s of {self.max_timeout:.1f}s limit",
+                            )
 
-                iteration: RLMIteration = self._completion_turn(
-                    prompt=current_prompt,
-                    lm_handler=lm_handler,
-                    environment=environment,
-                )
+                    # Current prompt = message history + additional prompt suffix
+                    context_count = (
+                        environment.get_context_count()
+                        if isinstance(environment, SupportsPersistence)
+                        else 1
+                    )
+                    history_count = (
+                        environment.get_history_count()
+                        if isinstance(environment, SupportsPersistence)
+                        else 0
+                    )
+                    current_prompt = message_history + [
+                        build_user_prompt(root_prompt, i, context_count, history_count)
+                    ]
 
-                # Check budget after each iteration
-                if self.max_budget is not None:
-                    current_usage = lm_handler.get_usage_summary()
-                    current_cost = current_usage.total_cost or 0.0
-                    self._cumulative_cost = current_cost
-                    if self._cumulative_cost > self.max_budget:
-                        time_end = time.perf_counter()
-                        self.verbose.print_budget_exceeded(self._cumulative_cost, self.max_budget)
-                        raise BudgetExceededError(
-                            spent=self._cumulative_cost,
-                            budget=self.max_budget,
-                            message=f"Budget exceeded after iteration {i + 1}: spent ${self._cumulative_cost:.6f} of ${self.max_budget:.6f} budget",
-                        )
-
-                # Check if RLM is done and has a final answer.
-                final_answer = find_final_answer(iteration.response, environment=environment)
-                iteration.final_answer = final_answer
-
-                # If logger is used, log the iteration.
-                if self.logger:
-                    self.logger.log(iteration)
-
-                # Verbose output for this iteration
-                self.verbose.print_iteration(iteration, i + 1)
-
-                if final_answer is not None:
-                    time_end = time.perf_counter()
-                    usage = lm_handler.get_usage_summary()
-                    self.verbose.print_final_answer(final_answer)
-                    self.verbose.print_summary(i + 1, time_end - time_start, usage.to_dict())
-
-                    # Store message history in persistent environment
-                    if self.persistent and isinstance(environment, SupportsPersistence):
-                        environment.add_history(message_history)
-
-                    return RLMChatCompletion(
-                        root_model=self.backend_kwargs.get("model_name", "unknown")
-                        if self.backend_kwargs
-                        else "unknown",
-                        prompt=prompt,
-                        response=final_answer,
-                        usage_summary=usage,
-                        execution_time=time_end - time_start,
+                    iteration: RLMIteration = self._completion_turn(
+                        prompt=current_prompt,
+                        lm_handler=lm_handler,
+                        environment=environment,
                     )
 
-                # Format the iteration for the next prompt.
-                new_messages = format_iteration(iteration)
+                    # Track errors from code execution (check stderr for errors)
+                    iteration_had_error = False
+                    for code_block in iteration.code_blocks:
+                        if code_block.result and code_block.result.stderr:
+                            iteration_had_error = True
+                            self._last_error = code_block.result.stderr
+                            break
 
-                # Update message history with the new messages.
-                message_history.extend(new_messages)
+                    if iteration_had_error:
+                        self._consecutive_errors += 1
+                    else:
+                        self._consecutive_errors = 0  # Reset on success
+
+                    # Check error threshold
+                    if self.max_errors is not None and self._consecutive_errors >= self.max_errors:
+                        self.verbose.print_limit_exceeded("errors", f"{self._consecutive_errors} consecutive errors (limit: {self.max_errors})")
+                        raise ErrorThresholdExceededError(
+                            error_count=self._consecutive_errors,
+                            threshold=self.max_errors,
+                            last_error=self._last_error,
+                            partial_answer=self._best_partial_answer,
+                            message=f"Error threshold exceeded: {self._consecutive_errors} consecutive errors (limit: {self.max_errors})",
+                        )
+
+                    # Check budget after each iteration
+                    if self.max_budget is not None:
+                        current_usage = lm_handler.get_usage_summary()
+                        current_cost = current_usage.total_cost or 0.0
+                        self._cumulative_cost = current_cost
+                        if self._cumulative_cost > self.max_budget:
+                            self.verbose.print_budget_exceeded(self._cumulative_cost, self.max_budget)
+                            raise BudgetExceededError(
+                                spent=self._cumulative_cost,
+                                budget=self.max_budget,
+                                message=f"Budget exceeded after iteration {i + 1}: spent ${self._cumulative_cost:.6f} of ${self.max_budget:.6f} budget",
+                            )
+
+                    # Check token limit after each iteration
+                    if self.max_tokens is not None:
+                        current_usage = lm_handler.get_usage_summary()
+                        total_tokens = current_usage.total_input_tokens + current_usage.total_output_tokens
+                        if total_tokens > self.max_tokens:
+                            self.verbose.print_limit_exceeded("tokens", f"{total_tokens:,} of {self.max_tokens:,} tokens")
+                            raise TokenLimitExceededError(
+                                tokens_used=total_tokens,
+                                token_limit=self.max_tokens,
+                                partial_answer=self._best_partial_answer,
+                                message=f"Token limit exceeded after iteration {i + 1}: {total_tokens:,} of {self.max_tokens:,} tokens",
+                            )
+
+                    # Check if RLM is done and has a final answer.
+                    final_answer = find_final_answer(iteration.response, environment=environment)
+                    iteration.final_answer = final_answer
+
+                    # Store as best partial answer (most recent response with content)
+                    if iteration.response and iteration.response.strip():
+                        self._best_partial_answer = iteration.response
+
+                    # If logger is used, log the iteration.
+                    if self.logger:
+                        self.logger.log(iteration)
+
+                    # Verbose output for this iteration
+                    self.verbose.print_iteration(iteration, i + 1)
+
+                    if final_answer is not None:
+                        time_end = time.perf_counter()
+                        usage = lm_handler.get_usage_summary()
+                        self.verbose.print_final_answer(final_answer)
+                        self.verbose.print_summary(i + 1, time_end - time_start, usage.to_dict())
+
+                        # Store message history in persistent environment
+                        if self.persistent and isinstance(environment, SupportsPersistence):
+                            environment.add_history(message_history)
+
+                        return RLMChatCompletion(
+                            root_model=self.backend_kwargs.get("model_name", "unknown")
+                            if self.backend_kwargs
+                            else "unknown",
+                            prompt=prompt,
+                            response=final_answer,
+                            usage_summary=usage,
+                            execution_time=time_end - time_start,
+                        )
+
+                    # Format the iteration for the next prompt.
+                    new_messages = format_iteration(iteration)
+
+                    # Update message history with the new messages.
+                    message_history.extend(new_messages)
+
+            except KeyboardInterrupt:
+                # User cancelled - return best answer if available
+                time_end = time.perf_counter()
+                self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
+                raise CancellationError(
+                    partial_answer=self._best_partial_answer,
+                    message="Execution cancelled by user (Ctrl+C)",
+                )
 
             # Default behavior: we run out of iterations, provide one final answer
             time_end = time.perf_counter()

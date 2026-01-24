@@ -351,6 +351,40 @@ class VerbosePrinter:
         self.console.print(panel)
         self.console.print()
 
+    def print_limit_exceeded(self, limit_type: str, details: str) -> None:
+        """Print a limit exceeded warning (timeout, tokens, errors, cancellation)."""
+        if not self.enabled:
+            return
+
+        # Map limit type to display name
+        limit_names = {
+            "timeout": "Timeout Exceeded",
+            "tokens": "Token Limit Exceeded",
+            "errors": "Error Threshold Exceeded",
+            "cancelled": "Execution Cancelled",
+        }
+        display_name = limit_names.get(limit_type, f"{limit_type.title()} Limit Exceeded")
+
+        # Title
+        title = Text()
+        title.append("⚠ ", style=STYLE_ERROR)
+        title.append(display_name, style=Style(color=COLORS["error"], bold=True))
+
+        # Content
+        content = Text(details, style=STYLE_ERROR)
+
+        panel = Panel(
+            content,
+            title=title,
+            title_align="left",
+            border_style=COLORS["error"],
+            padding=(0, 2),
+        )
+
+        self.console.print()
+        self.console.print(panel)
+        self.console.print()
+
     def print_final_answer(self, answer: Any) -> None:
         """Print the final answer."""
         if not self.enabled:
