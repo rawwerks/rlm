@@ -367,10 +367,12 @@ class RLM:
 
         Args:
             prompt: The prompt to process.
-            model: Optional model name (currently ignored, uses configured backends).
+            model: Optional model name. Note: Not yet supported for recursive calls.
+                   Currently uses the configured backends regardless of this parameter.
 
         Returns:
             The response string from either a child RLM or plain LM completion.
+            On error, returns an error message string (does not raise).
         """
         next_depth = self.depth + 1
 
@@ -381,7 +383,10 @@ class RLM:
                 client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
             else:
                 client = get_client(self.backend, self.backend_kwargs)
-            return client.completion(prompt)
+            try:
+                return client.completion(prompt)
+            except Exception as e:
+                return f"Error: LM query failed at max depth - {e}"
 
         # Otherwise: spawn a child RLM with its own LocalREPL
         child = RLM(
@@ -399,8 +404,14 @@ class RLM:
             logger=None,
             verbose=False,
         )
-        result = child.completion(prompt, root_prompt=None)
-        return result.response
+        try:
+            result = child.completion(prompt, root_prompt=None)
+            return result.response
+        except Exception as e:
+            return f"Error: Child RLM completion failed - {e}"
+        finally:
+            # Ensure child resources are cleaned up
+            child.close()
 
     def _validate_persistent_environment_support(self) -> None:
         """

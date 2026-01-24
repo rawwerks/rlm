@@ -381,9 +381,12 @@ class VerbosePrinter:
                 m.get("total_output_tokens", 0)
                 for m in usage_summary.get("model_usage_summaries", {}).values()
             )
+            total_cost = usage_summary.get("total_cost")
             if total_input or total_output:
                 summary_table.add_row("Input Tokens", f"{total_input:,}")
                 summary_table.add_row("Output Tokens", f"{total_output:,}")
+            if total_cost is not None:
+                summary_table.add_row("Total Cost", f"${total_cost:.6f}")
 
         # Wrap in rule
         self.console.print()
